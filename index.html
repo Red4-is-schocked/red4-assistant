@@ -571,20 +571,59 @@
     return /overload|unavailable|resource_exhausted|high demand/i.test(info);
   }
 
-  async function callGeminiWithRetry() {
+  async function readStream(res, onChunk) {
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let fullText = '';
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      const events = buffer.split('\n\n');
+      buffer = events.pop(); // last chunk may be incomplete, keep for next read
+
+      for (const evt of events) {
+        const line = evt.trim();
+        if (!line.startsWith('data:')) continue;
+        const jsonStr = line.slice(5).trim();
+        if (!jsonStr) continue;
+        try {
+          const obj = JSON.parse(jsonStr);
+          const candidate = obj.candidates && obj.candidates[0];
+          const piece = candidate && candidate.content && candidate.content.parts
+            ? candidate.content.parts.map(p => p.text || '').join('')
+            : '';
+          if (piece) {
+            fullText += piece;
+            onChunk(piece, fullText);
+          }
+        } catch (e) { /* incomplete or non-JSON chunk, skip */ }
+      }
+    }
+
+    return fullText;
+  }
+
+  async function callGeminiStreamWithRetry(onChunk) {
     let attempt = 0;
     let delay = 2000; // 2s, then 4s, 8s, 16s
 
     while (true) {
-      const res = await fetch(API_BASE + encodeURIComponent(model) + ':generateContent?key=' + encodeURIComponent(apiKey), {
+      const res = await fetch(API_BASE + encodeURIComponent(model) + ':streamGenerateContent?alt=sse&key=' + encodeURIComponent(apiKey), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ contents: history })
       });
 
-      const data = await res.json().catch(() => null);
+      if (res.ok) {
+        const fullText = await readStream(res, onChunk);
+        return { ok: true, fullText };
+      }
 
-      if (res.ok) return { res, data };
+      const data = await res.json().catch(() => null);
 
       if (isOverloadError(res.status, data) && attempt < MAX_RETRIES) {
         attempt++;
@@ -596,7 +635,7 @@
         continue;
       }
 
-      return { res, data };
+      return { ok: false, res, data };
     }
   }
 
@@ -618,28 +657,32 @@
     sendBtn.disabled = true;
     showTyping();
 
+    let assistantDiv = null;
+
     try {
-      const { res, data } = await callGeminiWithRetry();
+      const result = await callGeminiStreamWithRetry((piece, fullText) => {
+        if (!assistantDiv) {
+          hideTyping();
+          assistantDiv = appendMessage('assistant', '');
+        }
+        assistantDiv.textContent = fullText;
+        scrollToBottom();
+      });
+
       hideTyping();
 
-      if (!res.ok) {
-        const message = (data && data.error && data.error.message) || ('Request failed with status ' + res.status);
-        appendMessage('error', message + (isOverloadError(res.status, data) ? ' (retried automatically, still no luck — try again shortly.)' : ''));
+      if (!result.ok) {
+        const message = (result.data && result.data.error && result.data.error.message) || ('Request failed with status ' + result.res.status);
+        appendMessage('error', message + (isOverloadError(result.res.status, result.data) ? ' (retried automatically, still no luck — try again shortly.)' : ''));
         return;
       }
 
-      const candidate = data.candidates && data.candidates[0];
-      const reply = candidate && candidate.content && candidate.content.parts
-        ? candidate.content.parts.map(p => p.text || '').join('')
-        : '';
-
-      if (!reply) {
+      if (!result.fullText) {
         appendMessage('error', 'The model returned an empty response. It may have been blocked by a safety filter — try rephrasing.');
         return;
       }
 
-      appendMessage('assistant', reply);
-      history.push({ role: 'model', parts: [{ text: reply }] });
+      history.push({ role: 'model', parts: [{ text: result.fullText }] });
 
     } catch (err) {
       hideTyping();
